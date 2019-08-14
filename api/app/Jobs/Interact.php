@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Player;
 use Carbon\Carbon;
 use App\EventInitiation;
 use App\EventInitiationUser;
@@ -71,7 +72,11 @@ class Interact implements ShouldQueue
                 }
             } elseif (isset($action->value)) {
                 if (in_array($action->value, ['participate', 'refuse'])) {
-                    if (isset($eventInitiation->event_id) || (isset($eventInitiation->expire_at) && $expireAtObj->diffInSeconds(now()) < $matchCreationWaitTime)) {
+                    if (
+                        isset($eventInitiation->event_id) ||
+                        (isset($eventInitiation->expire_at) &&
+                            $expireAtObj->diffInSeconds(now()) < $matchCreationWaitTime)
+                    ) {
                         sendSlackMessage([
                             'channel' => $this->payload->channel->id,
                             'user' => $this->payload->user->id,
@@ -95,6 +100,22 @@ class Interact implements ShouldQueue
                     }
 
                     $eventInitiation->expire_at = now();
+                } elseif ($action->value === 'schedule_again' && isset($eventInitiation->expire_at)) {
+                    if (
+                        isset($eventInitiation->event_id) ||
+                        $expireAtObj->diffInSeconds(now()) < $matchCreationWaitTime
+                    ) {
+                        sendSlackMessage([
+                            'channel' => $this->payload->channel->id,
+                            'user' => $this->payload->user->id,
+                            'text' => trans('event-initiation.cannot_schedule'),
+                        ], 'postEphemeral');
+
+                        return;
+                    }
+
+                    $eventInitiation->expire_at = null;
+                    $eventInitiation->start_when_possible = false;
                 }
             }
         }
@@ -102,7 +123,7 @@ class Interact implements ShouldQueue
         $eventInitiationUsers = $this->getEventInitiationUsers($eventInitiation->id);
         $blocks = $this->payload->message->blocks;
         $playerElements = [];
-        $user = null;
+        $userRealName = null;
         $amountOfParticipants = 0;
         $amountOfRefusers = 0;
 
@@ -115,15 +136,21 @@ class Interact implements ShouldQueue
                 $amountOfRefusers++;
             }
 
-            $eventInitiationSlackUser = getSlackUser($eventInitiationUser->user_id);
+            if ($eventInitiationUser->player === null) {
+                // Player does not exist in database.
+                // Get real name of user by making a Slack API request.
+                $eventInitiationSlackUserRealName = getSlackUser($eventInitiationUser->user_id)->profile->real_name;
+            } else {
+                $eventInitiationSlackUserRealName = $eventInitiationUser->player->name;
+            }
 
             if ($eventInitiationUser->user_id === $this->payload->user->id) {
-                $user = $eventInitiationSlackUser;
+                $userRealName = $eventInitiationSlackUserRealName;
             }
 
             $playerElements[] = [
                 'type' => 'plain_text',
-                'text' => "{$emoji} {$eventInitiationSlackUser->profile->real_name}",
+                'text' => "{$emoji} {$eventInitiationSlackUserRealName}",
                 'emoji' => true,
             ];
         }
@@ -153,46 +180,71 @@ class Interact implements ShouldQueue
         ];
 
         // Create a match if initiation already expired and amount of
-        // participants is now high enough
-        if ($expireAtObj->lessThan(now()) && $amountOfParticipants >= Config::get('match.min_users')) {
+        // participants is now high enough and the scheduled match is not reset.
+        if (
+            $expireAtObj->lessThan(now()) &&
+            $amountOfParticipants >= Config::get('match.min_users') &&
+            $eventInitiation->getOriginal('start_when_possible')
+        ) {
             deleteEventInitiationScheduledSlackMessages($eventInitiation->id);
             CreateMatchFromInitiation::dispatch($eventInitiation->id);
         } elseif ($eventInitiation->isDirty('expire_at')) {
-            $blocks[0]->text->text = trans('event-initiation.choose_for_match_with_time', [
-                'time' => $eventInitiation->expire_at->toTimeString(),
-            ]);
-
-            if (is_null($eventInitiation->getOriginal('expire_at'))) {
-                $matchTimeText = trans('event-initiation.match_time_changed_to', [
-                    'time' => $eventInitiation->expire_at->toTimeString(),
+            if (is_null($eventInitiation->expire_at)) {
+                $blocks[0]->text->text = trans('event-initiation.choose_for_next_match');
+                $matchTimeText = trans('event-initiation.scheduled_match_reset', [
+                    'time' => Carbon::parse($eventInitiation->getOriginal('expire_at'))->toTimeString(),
                 ]);
             } else {
-                $matchTimeText = trans('event-initiation.match_time_changed_from_to', [
-                    'from_time' => Carbon::parse($eventInitiation->getOriginal('expire_at'))->toTimeString(),
-                    'to_time' => $eventInitiation->expire_at->toTimeString(),
+                $blocks[0]->text->text = trans('event-initiation.choose_for_match_with_time', [
+                    'time' => $eventInitiation->expire_at->toTimeString(),
                 ]);
+
+                if (is_null($eventInitiation->getOriginal('expire_at'))) {
+                    $matchTimeText = trans('event-initiation.match_time_changed_to', [
+                        'time' => $eventInitiation->expire_at->toTimeString(),
+                    ]);
+                } else {
+                    $matchTimeText = trans('event-initiation.match_time_changed_from_to', [
+                        'from_time' => Carbon::parse($eventInitiation->getOriginal('expire_at'))->toTimeString(),
+                        'to_time' => $eventInitiation->expire_at->toTimeString(),
+                    ]);
+                }
             }
 
             deleteEventInitiationScheduledSlackMessages($eventInitiation->id);
 
             $eventInitiation->save();
 
+            if (is_null($userRealName)) {
+                // User did not chose, but changed match time
+                $player = Player::where('user_id', $this->payload->user->id)
+                    ->first();
+
+                if ($player === null) {
+                    $userRealName = getSlackUser($this->payload->user->id)->profile->real_name;
+                } else {
+                    $userRealName = $player->profile->real_name;
+                }
+            }
+
             sendSlackMessage([
                 'channel' => $this->payload->channel->id,
                 'text' => trans('event-initiation.match_time_changed_at_by_user', [
                     'id' => $eventInitiation->id,
                     'time' => now()->toTimeString(),
-                    'user' => $user->profile->real_name,
+                    'user' => $userRealName,
                 ]) . ' ' . $matchTimeText,
             ]);
 
-            if (Carbon::parse($eventInitiation->expire_at)->lessThanOrEqualTo(now())) {
-                CreateMatchFromInitiation::dispatch($eventInitiation->id);
-            } else {
-                CreateMatchFromInitiation::dispatch($eventInitiation->id)
-                    ->delay($eventInitiation->expire_at);
+            if (!is_null($eventInitiation->expire_at)) {
+                if (Carbon::parse($eventInitiation->expire_at)->lessThanOrEqualTo(now())) {
+                    CreateMatchFromInitiation::dispatch($eventInitiation->id);
+                } else {
+                    CreateMatchFromInitiation::dispatch($eventInitiation->id)
+                        ->delay($eventInitiation->expire_at);
 
-                scheduleSlackMessage($eventInitiation, $this->payload->channel->id);
+                    scheduleSlackMessage($eventInitiation, $this->payload->channel->id);
+                }
             }
         }
 
@@ -228,6 +280,7 @@ class Interact implements ShouldQueue
     private function getEventInitiationUsers(int $id): Collection
     {
         return EventInitiationUser::where('event_initiation_id', $id)
+            ->with(['player'])
             ->orderBy('updated_at', 'desc')
             ->get();
     }
